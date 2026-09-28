@@ -1,0 +1,29 @@
+[
+  {
+    "id": "job_001",
+    "title": "Senior Python Developer",
+    "description": "We are looking for a Senior Python Developer with 5+ years of experience. Required: Python, Django, PostgreSQL. Preferred: Docker, Kubernetes. Remote position.",
+    "company": "Tech Corp Inc.",
+    "url": "https://example.com/jobs/senior-python-developer",
+    "location": "San Francisco, CA",
+    "employmentType": "Full-time"
+  },
+  {
+    "id": "job_002",
+    "title": "Junior JavaScript Developer",
+    "description": "Entry-level JavaScript position. Must have: JavaScript, React. Nice to have: TypeScript, Node.js.",
+    "company": "StartUp LLC",
+    "url": "https://example.com/jobs/junior-js",
+    "location": "New York, NY",
+    "employmentType": "Full-time"
+  },
+  {
+    "id": "job_003",
+    "title": "Full Stack Engineer",
+    "description": "Looking for a Full Stack Engineer with Python backend and React frontend experience. Required: Python, JavaScript, PostgreSQL. Hybrid remote position.",
+    "company": "Tech Corp Inc.",
+    "url": "https://example.com/jobs/fullstack",
+    "location": "San Francisco, CA",
+    "employmentType": "Full-time"
+  }
+]

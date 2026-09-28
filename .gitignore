@@ -1,0 +1,88 @@
+# -----------------------------
+# Python Standard
+# -----------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+lib/
+lib64/
+
+# -----------------------------
+# Virtual Environments
+# -----------------------------
+venv/
+.venv/
+env/
+ENV/
+
+# -----------------------------
+# Environment Variables
+# -----------------------------
+.env
+.env.local
+# (Explicitly keep your .env.example)
+!.env.example
+
+# -----------------------------
+# Testing, Linting & Type Checking
+# -----------------------------
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# -----------------------------
+# IDE & OS Files
+# -----------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# -----------------------------
+# Project-Specific Artifacts
+# -----------------------------
+
+# SQLite Databases (Cache & Persistence)
+*.db
+*.sqlite3
+resume_ranker.db
+embedding_cache.db
+mock_cache.db
+
+# Pipeline Raw / Intermediate JSON Outputs
+jobs.json
+apify_raw.json
+cleaned_jobs.json
+cleaned_resume.json
+output.json
+matched_jobs.json
+retrieved_jobs.json
+rerank_results.json
+llm_judge_results.json
+results.json
+
+# Orchestration Run Directories & Reports
+runs/
+report.html
+manifest.json
+
+# Sensitive / Personal Fixtures
+# Ignore real resumes and downloaded job payloads in the tests folder
+tests/fixtures/resumes/*.pdf
+tests/fixtures/resumes/*.docx
+tests/fixtures/resumes/*.txt
+tests/fixtures/jobs/*.json
+# (Allow keep files so the directories stay in git)
+!tests/fixtures/resumes/.gitkeep
+!tests/fixtures/jobs/.gitkeepstorage/
+storage/
