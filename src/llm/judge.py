@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.llm.client import OpenAIResponsesTransport, RawCompletion, ResponsesTransport
+from src.llm.client import AttemptUsage, OpenAIResponsesTransport, RawCompletion, ResponsesTransport
 from src.llm.schemas import (
     JudgeConfig,
     JudgeResponse,
@@ -20,6 +20,7 @@ from src.llm.schemas import (
     RequirementStatus,
     prompt_version,
 )
+from src.models.job import JobRecord
 from src.scoring import final_qualification_score
 from src.utils.hashing import deterministic_json_hash
 
@@ -35,6 +36,8 @@ class JudgeMetrics:
     input_tokens: int = 0
     output_tokens: int = 0
     estimated_cost_usd: float = 0.0
+    actual_cost_usd: float = 0.0
+    total_accounted_cost_usd: float = 0.0
     latencies: list[float] = field(default_factory=list)
     budget_stop_reason: str | None = None
 
@@ -50,6 +53,8 @@ class JudgeMetrics:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "estimated_cost_usd": self.estimated_cost_usd,
+            "actual_cost_usd": self.actual_cost_usd,
+            "total_accounted_cost_usd": self.total_accounted_cost_usd,
             "latency_p50": _percentile(ordered, 0.50),
             "latency_p95": _percentile(ordered, 0.95),
             "budget_stop_reason": self.budget_stop_reason,
@@ -66,6 +71,54 @@ class JudgeResult:
     cache_hit: bool = False
     model_id: str | None = None
     usage: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class JudgableJob:
+    """Validated handoff from deterministic reranking to LLM judging."""
+
+    job: JobRecord
+    rerank_result: dict[str, Any] | None = None
+
+    @property
+    def job_id(self) -> str:
+        return self.job.job_id
+
+
+def resolve_reranked_jobs(
+    reranked_jobs: list[JobRecord | dict[str, Any] | JudgableJob],
+    jobs_by_id: dict[str, JobRecord] | None = None,
+) -> list[JudgableJob]:
+    """Resolve reranker results to validated jobs with an explicit contract."""
+    resolved: list[JudgableJob] = []
+    for item in reranked_jobs:
+        if isinstance(item, JudgableJob):
+            resolved.append(item)
+            continue
+        if isinstance(item, JobRecord):
+            resolved.append(JudgableJob(job=item))
+            continue
+        if not isinstance(item, dict):
+            raise TypeError("each judged item must be a JobRecord, JudgableJob, or reranker dictionary")
+
+        embedded_job = item.get("job")
+        if isinstance(embedded_job, JobRecord):
+            resolved.append(JudgableJob(job=embedded_job, rerank_result=item))
+            continue
+        if isinstance(embedded_job, dict):
+            try:
+                resolved.append(JudgableJob(job=JobRecord.model_validate(embedded_job), rerank_result=item))
+            except Exception as exc:
+                raise ValueError("reranker dictionary contains an invalid 'job' payload") from exc
+            continue
+
+        job_id = item.get("job_id")
+        if not isinstance(job_id, str) or jobs_by_id is None or job_id not in jobs_by_id:
+            raise ValueError(
+                "reranker result requires a JobRecord in 'job' or a matching jobs_by_id entry"
+            )
+        resolved.append(JudgableJob(job=jobs_by_id[job_id], rerank_result=item))
+    return resolved
 
 
 @dataclass
@@ -207,7 +260,7 @@ def _validate_evidence(response: JudgeResponse, candidate_source: str, job_sourc
         if evaluation.status in {RequirementStatus.MATCHED, RequirementStatus.PARTIALLY_MATCHED}:
             if not evidence_is_grounded(evaluation.candidate_evidence, candidate_source):
                 raise ValueError(f"ungrounded candidate evidence for {evaluation.requirement}")
-            if not evidence_is_grounded(evaluation.job_evidence, job_source):
+            if evaluation.job_evidence is not None and not evidence_is_grounded(evaluation.job_evidence, job_source):
                 raise ValueError(f"ungrounded job evidence for {evaluation.requirement}")
     for strength in response.strengths:
         if not evidence_is_grounded(strength.candidate_evidence, candidate_source):
@@ -217,21 +270,65 @@ def _validate_evidence(response: JudgeResponse, candidate_source: str, job_sourc
 def _estimate_cost(prompt: str, config: JudgeConfig, model_id: str) -> float:
     pricing = config.pricing[model_id]
     input_tokens = max(1, len(prompt) // 4)
-    return (input_tokens * pricing["input_per_mtok"] + config.assumed_output_tokens * pricing["output_per_mtok"]) / 1_000_000
+    return (input_tokens * pricing["input_per_mtok"] + config.max_output_tokens * pricing["output_per_mtok"]) / 1_000_000
 
 
 class _Budget:
     def __init__(self, limit: float) -> None:
         self.limit = limit
+        self.committed = 0.0
         self.reserved = 0.0
         self.lock = asyncio.Lock()
 
     async def reserve(self, amount: float) -> _Reservation | None:
         async with self.lock:
-            if self.reserved + amount > self.limit:
+            if self.committed + self.reserved + amount > self.limit:
                 return None
             self.reserved += amount
             return _Reservation(amount)
+
+    async def settle(self, reservation: _Reservation, actual_cost: float) -> None:
+        async with self.lock:
+            if reservation.released:
+                return
+            self.reserved -= reservation.amount
+            self.committed += max(0.0, actual_cost)
+            reservation.released = True
+
+
+def _record_attempts(
+    metrics: JudgeMetrics,
+    attempts: list[AttemptUsage],
+    config: JudgeConfig,
+    model_id: str,
+    prompt: str,
+    default_outcome: str = "transport_error",
+) -> float:
+    """Record each attempt once and return its accounted cost."""
+    if not attempts:
+        attempts = [AttemptUsage(None, None, 0.0, default_outcome, default_outcome != "success")]
+    total = 0.0
+    for attempt in attempts:
+        input_tokens = attempt.input_tokens or max(1, len(prompt) // 4)
+        output_tokens = attempt.output_tokens or config.assumed_output_tokens
+        cost = (
+            input_tokens * config.pricing[model_id]["input_per_mtok"]
+            + output_tokens * config.pricing[model_id]["output_per_mtok"]
+        ) / 1_000_000
+        metrics.requests += 1
+        metrics.latencies.append(attempt.latency_seconds)
+        metrics.total_accounted_cost_usd += cost
+        total += cost
+        if attempt.estimated:
+            metrics.estimated_cost_usd += cost
+        else:
+            metrics.actual_cost_usd += cost
+            if attempt.input_tokens is not None:
+                metrics.input_tokens += attempt.input_tokens
+            if attempt.output_tokens is not None:
+                metrics.output_tokens += attempt.output_tokens
+    metrics.transport_retries += max(0, len(attempts) - 1)
+    return total
 
 
 async def judge_jobs_async(
@@ -239,6 +336,7 @@ async def judge_jobs_async(
     reranked_jobs: list[Any],
     config: JudgeConfig,
     transport: ResponsesTransport | None = None,
+    jobs_by_id: dict[str, JobRecord] | None = None,
 ) -> tuple[list[JudgeResult], JudgeMetrics]:
     """Judge reranked jobs independently with bounded concurrency."""
     config.validate_pricing()
@@ -247,9 +345,13 @@ async def judge_jobs_async(
     metrics = JudgeMetrics()
     budget = _Budget(config.max_total_cost_usd)
     semaphore = asyncio.Semaphore(config.max_concurrency)
-    jobs = reranked_jobs[: config.max_llm_jobs_per_run]
+    jobs = resolve_reranked_jobs(
+        reranked_jobs[: config.max_llm_jobs_per_run],
+        jobs_by_id=jobs_by_id,
+    )
 
-    async def judge_one(job: Any) -> JudgeResult:
+    async def judge_one(judgable_job: JudgableJob) -> JudgeResult:
+        job = judgable_job.job
         model_id = config.model_id
         key = _cache_key(job, candidate_profile, model_id)
         cached = cache.get(key)
@@ -259,60 +361,71 @@ async def judge_jobs_async(
             return JudgeResult(job_id=job.job_id, judge_status="accepted", response=response, score=final_qualification_score(response, _requirements(job)), cache_hit=True, model_id=model_id, usage=usage)
 
         requirements = _requirements(job)
-        prompt = _prompt(candidate_profile, job, requirements)
-        reservation = await budget.reserve(_estimate_cost(prompt, config, model_id))
-        if reservation is None:
-            metrics.budget_stop_reason = "cost_reservation_exceeded"
-            return JudgeResult(job_id=job.job_id, judge_status="budget_skipped", error="cost budget exhausted", model_id=model_id)
-
         candidate_source = json.dumps(_candidate_payload(candidate_profile), ensure_ascii=True)
         job_source = json.dumps(_job_payload(job), ensure_ascii=True)
         semantic_retry = 0
         api_attempts = 0
         max_attempts = max(1, config.max_transport_retries + config.max_semantic_retries)
         correction = None
-        try:
-            async with semaphore:
-                while True:
-                    completion: RawCompletion | None = None
-                    try:
-                        completion = await transport.complete(
-                            prompt=_prompt(candidate_profile, job, requirements, correction),
-                            model_id=model_id,
-                            timeout_seconds=config.request_timeout_s,
-                            max_transport_retries=min(
-                                config.max_transport_retries,
-                                max(0, max_attempts - api_attempts - 1),
-                            ),
+        async with semaphore:
+            while True:
+                attempt_prompt = _prompt(candidate_profile, job, requirements, correction)
+                reservation = await budget.reserve(_estimate_cost(attempt_prompt, config, model_id))
+                if reservation is None:
+                    metrics.budget_stop_reason = "cost_reservation_exceeded"
+                    return JudgeResult(job_id=job.job_id, judge_status="budget_skipped", error="cost budget exhausted", model_id=model_id)
+                completion: RawCompletion | None = None
+                try:
+                    completion = await transport.complete(
+                        prompt=attempt_prompt,
+                        model_id=model_id,
+                        timeout_seconds=config.request_timeout_s,
+                        max_transport_retries=min(
+                            config.max_transport_retries,
+                            max(0, max_attempts - api_attempts - 1),
+                        ),
+                        max_output_tokens=config.max_output_tokens,
+                        retry_base_backoff_seconds=config.retry_base_backoff_seconds,
+                        retry_max_backoff_seconds=config.retry_max_backoff_seconds,
+                    )
+                    completion_attempts = completion.attempts or [
+                        AttemptUsage(
+                            completion.input_tokens,
+                            completion.output_tokens,
+                            completion.latency_seconds,
+                            "success",
+                            False,
                         )
-                        api_attempts += 1 + completion.transport_retries
-                        metrics.requests += 1 + completion.transport_retries
-                        metrics.transport_retries += completion.transport_retries
-                        metrics.input_tokens += completion.input_tokens
-                        metrics.output_tokens += completion.output_tokens
-                        metrics.latencies.append(completion.latency_seconds)
-                        metrics.estimated_cost_usd += (completion.input_tokens * config.pricing[model_id]["input_per_mtok"] + completion.output_tokens * config.pricing[model_id]["output_per_mtok"]) / 1_000_000
-                        response = JudgeResponse.model_validate(completion.payload)
-                        _validate_completeness(response, requirements)
-                        _validate_evidence(response, candidate_source, job_source)
-                        usage = {"input_tokens": completion.input_tokens, "output_tokens": completion.output_tokens, "latency_seconds": completion.latency_seconds, "transport_retries": completion.transport_retries}
-                        cache.put(key, response, completion.raw_response, usage)
-                        metrics.successes += 1
-                        return JudgeResult(job_id=job.job_id, judge_status="accepted", response=response, score=final_qualification_score(response, requirements), model_id=model_id, usage=usage)
-                    except Exception as exc:
-                        transport_retries = getattr(exc, "retries", 0)
-                        api_attempts += 1 + transport_retries
-                        metrics.requests += 1 + transport_retries
-                        metrics.transport_retries += transport_retries
-                        metrics.estimated_cost_usd += _estimate_cost(prompt, config, model_id) * (1 + transport_retries)
-                        if semantic_retry >= config.max_semantic_retries or api_attempts >= max_attempts:
-                            metrics.failures += 1
-                            return JudgeResult(job_id=job.job_id, judge_status="failed", error=str(exc), model_id=model_id)
-                        semantic_retry += 1
-                        metrics.semantic_retries += 1
-                        correction = str(exc)
-        finally:
-            reservation.released = True
+                    ]
+                    api_attempts += len(completion_attempts)
+                    attempt_cost = _record_attempts(metrics, completion_attempts, config, model_id, attempt_prompt, "success")
+                    await budget.settle(reservation, attempt_cost)
+                    response = JudgeResponse.model_validate(completion.payload)
+                    _validate_completeness(response, requirements)
+                    _validate_evidence(response, candidate_source, job_source)
+                    usage = {"input_tokens": completion.input_tokens, "output_tokens": completion.output_tokens, "latency_seconds": completion.latency_seconds, "transport_retries": completion.transport_retries}
+                    cache.put(key, response, completion.raw_response, usage)
+                    metrics.successes += 1
+                    return JudgeResult(job_id=job.job_id, judge_status="accepted", response=response, score=final_qualification_score(response, requirements), model_id=model_id, usage=usage)
+                except Exception as exc:
+                    if completion is None:
+                        attempt_cost = _record_attempts(
+                            metrics,
+                            getattr(exc, "attempts", []),
+                            config,
+                            model_id,
+                            attempt_prompt,
+                        )
+                        api_attempts += max(1, len(getattr(exc, "attempts", [])))
+                    else:
+                        attempt_cost = 0.0
+                    await budget.settle(reservation, attempt_cost)
+                    if semantic_retry >= config.max_semantic_retries or api_attempts >= max_attempts:
+                        metrics.failures += 1
+                        return JudgeResult(job_id=job.job_id, judge_status="failed", error=str(exc), model_id=model_id)
+                    semantic_retry += 1
+                    metrics.semantic_retries += 1
+                    correction = str(exc)
 
     results = await asyncio.gather(*(judge_one(job) for job in jobs))
     return results, metrics
@@ -323,10 +436,19 @@ def judge_jobs(
     reranked_jobs: list[Any],
     config: JudgeConfig,
     transport: ResponsesTransport | None = None,
+    jobs_by_id: dict[str, JobRecord] | None = None,
 ) -> tuple[list[JudgeResult], JudgeMetrics]:
     """Synchronous wrapper; async callers must use ``judge_jobs_async``."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(judge_jobs_async(candidate_profile, reranked_jobs, config, transport))
+        return asyncio.run(
+            judge_jobs_async(
+                candidate_profile,
+                reranked_jobs,
+                config,
+                transport,
+                jobs_by_id,
+            )
+        )
     raise RuntimeError("judge_jobs() called inside a running event loop; await judge_jobs_async() instead")

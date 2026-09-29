@@ -26,34 +26,37 @@ class Recommendation(str, Enum):
     DO_NOT_APPLY = "do_not_apply"
 
 
-class RequirementInput(BaseModel):
+class StrictSchemaModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class RequirementInput(StrictSchemaModel):
     text: str = Field(min_length=1)
     classification: Literal["hard", "preferred", "unknown"]
 
 
-class RequirementEvaluation(BaseModel):
+class RequirementEvaluation(StrictSchemaModel):
     requirement: str = Field(min_length=1)
     status: RequirementStatus
-    candidate_evidence: str | None = None
-    job_evidence: str | None = None
+    candidate_evidence: str | None
+    job_evidence: str | None
 
     @model_validator(mode="after")
     def require_evidence_for_positive_match(self) -> "RequirementEvaluation":
         if self.status in {RequirementStatus.MATCHED, RequirementStatus.PARTIALLY_MATCHED}:
             if not self.candidate_evidence or not self.candidate_evidence.strip():
                 raise ValueError("matched requirements require candidate_evidence")
-            if not self.job_evidence or not self.job_evidence.strip():
-                raise ValueError("matched requirements require job_evidence")
+        if self.job_evidence is not None and not self.job_evidence.strip():
+            raise ValueError("job_evidence must be non-empty when supplied")
         return self
 
 
-class Strength(BaseModel):
+class Strength(StrictSchemaModel):
     claim: str = Field(min_length=1)
     candidate_evidence: str = Field(min_length=1)
 
 
-class JudgeResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class JudgeResponse(StrictSchemaModel):
 
     overall_fit: int = Field(ge=0, le=100)
     skills_fit: int = Field(ge=0, le=100)
@@ -92,6 +95,9 @@ class JudgeConfig(BaseModel):
     cache_db_path: str = "cache.sqlite"
     pricing: dict[str, dict[str, float]] = Field(default_factory=dict)
     assumed_output_tokens: int = Field(default=1000, gt=0)
+    max_output_tokens: int = Field(default=1000, gt=0)
+    retry_base_backoff_seconds: float = Field(default=0.5, ge=0)
+    retry_max_backoff_seconds: float = Field(default=8.0, ge=0)
 
     def validate_pricing(self, model_id: str | None = None) -> None:
         selected = model_id or self.model_id

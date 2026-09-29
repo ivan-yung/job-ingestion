@@ -1,0 +1,37 @@
+config_version = "1"
+apify_api_token_env = "APIFY_API_TOKEN"
+cache_db_path = "e2e-cache.sqlite"
+runs_dir = "runs"
+
+[retrieval]
+top_k = 150
+rrf_k = 60
+
+[retrieval.semantic_weights]
+overall = 0.50
+skills = 0.30
+role = 0.20
+
+[rerank]
+top_k = 50
+
+[judge]
+model_id = "gpt-5.4-nano"
+max_concurrency = 5
+max_llm_jobs_per_run = 10
+max_total_cost_usd = 2.0
+request_timeout_s = 30.0
+max_transport_retries = 3
+max_semantic_retries = 2
+max_output_tokens = 1000
+assumed_output_tokens = 1000
+
+[judge.pricing."gpt-5.4-nano"]
+input_per_mtok = 0.20
+output_per_mtok = 1.25
+
+[application_priority.weights]
+qualification = 0.60
+location_fit = 0.15
+remote_fit = 0.15
+company_interest = 0.10

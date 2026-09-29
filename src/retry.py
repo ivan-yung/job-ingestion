@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
 T = TypeVar("T")
@@ -55,4 +56,34 @@ def retry_call(
                 on_retry()
             delay = min(max_backoff_seconds, base_backoff_seconds * (2**attempt))
             time.sleep(delay + random.uniform(0, delay * 0.25))
+            attempt += 1
+
+
+async def retry_async_call(
+    operation: Callable[[], Awaitable[T]],
+    *,
+    max_retries: int,
+    base_backoff_seconds: float = 0.5,
+    max_backoff_seconds: float = 8.0,
+    on_retry: Callable[[], None] | None = None,
+    on_failure: Callable[[Exception, int], None] | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    random_value: Callable[[], float] = random.random,
+) -> T:
+    """Retry transient async failures without blocking the event loop."""
+    attempt = 0
+    while True:
+        try:
+            return await operation()
+        except Exception as exc:
+            if not is_transient_error(exc):
+                raise
+            if on_failure is not None:
+                on_failure(exc, attempt)
+            if attempt >= max_retries:
+                raise RetryExhaustedError(exc, attempt) from exc
+            if on_retry is not None:
+                on_retry()
+            delay = min(max_backoff_seconds, base_backoff_seconds * (2**attempt))
+            await sleep(delay + (delay * 0.25 * random_value()))
             attempt += 1

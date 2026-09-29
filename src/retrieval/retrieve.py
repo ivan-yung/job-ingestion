@@ -34,10 +34,18 @@ def retrieve_jobs(
     jobs: list[JobRecord],
     top_k: int = 150,
     db_path: str = "resume_ranker.db",
+    semantic_weights: dict[str, float] | None = None,
+    rrf_k: int = RRF_K,
 ) -> list[dict[str, Any]]:
     """Retrieve top jobs using Hybrid Search (Semantic + BM25) and RRF."""
     if not jobs:
         return []
+
+    weights = semantic_weights or {
+        "overall": WEIGHT_OVERALL,
+        "skills": WEIGHT_SKILLS,
+        "role": WEIGHT_ROLE,
+    }
 
     cache = SQLiteEmbeddingCache(db_path)
     provider = OpenAIEmbeddingProvider()
@@ -76,7 +84,7 @@ def retrieve_jobs(
         sim_skills = cosine_similarity(cand_skills, vector_map.get(j_items["skills"].content_hash))
         sim_role = cosine_similarity(cand_role, vector_map.get(j_items["role"].content_hash))
         
-        score = (WEIGHT_OVERALL * sim_overall) + (WEIGHT_SKILLS * sim_skills) + (WEIGHT_ROLE * sim_role)
+        score = (weights["overall"] * sim_overall) + (weights["skills"] * sim_skills) + (weights["role"] * sim_role)
         semantic_scores.append((job.job_id, score))
 
     semantic_scores.sort(key=lambda x: x[1], reverse=True)
@@ -105,7 +113,7 @@ def retrieve_jobs(
             "job_id": job.job_id,
             "semantic_rank": s_rank,
             "bm25_rank": b_rank,
-            "rrf_score": compute_rrf(s_rank, b_rank),
+            "rrf_score": compute_rrf(s_rank, b_rank, rrf_k),
             "semantic_score": semantic_score_map[job.job_id],
             "bm25_score": bm25_score_map[job.job_id]
         })

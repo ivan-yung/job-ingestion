@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Resume Ranker Report</title>
+  <style>
+    body { font-family: system-ui, sans-serif; line-height: 1.45; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; color: #202124; }
+    h1, h2 { line-height: 1.15; }
+    section { margin: 2rem 0; }
+    article { border: 1px solid #d9dce1; border-radius: 6px; margin: .75rem 0; padding: 1rem; }
+    .score { font-weight: 700; }
+    .review { color: #8a5200; font-weight: 700; }
+    .muted { color: #5f6368; }
+    summary { cursor: pointer; }
+    pre { overflow-x: auto; background: #f6f8fa; padding: .75rem; }
+  </style>
+</head>
+<body>
+  <h1>Resume Ranker Report</h1>
+
+  <section>
+    <h2>Ranked results ({{ ranked|length }})</h2>
+    {% for row in ranked %}
+    <article>
+      <h3>{{ row.job.title }} <span class="muted">at {{ row.job.company }}</span></h3>
+      <p><span class="score">Priority {{ "%.3f"|format(row.priority.application_priority_score) }}</span>
+        | Qualification {{ "%.1f"|format(row.priority.final_score.qualification_score) }}
+        | {{ row.priority.recommendation }}
+        {% if row.priority.needs_review %}<span class="review">Needs review</span>{% endif %}</p>
+      <details><summary>Evidence and feature breakdown</summary>
+        <pre>{{ row|tojson(indent=2) }}</pre>
+      </details>
+    </article>
+    {% else %}<p class="muted">No scored recommendations.</p>{% endfor %}
+  </section>
+
+  <section>
+    <h2>Not recommended ({{ not_recommended|length }})</h2>
+    {% for row in not_recommended %}
+    <details><summary>{{ row.job.title }} at {{ row.job.company }} | {{ row.priority.final_score.qualification_score }}</summary>
+      <pre>{{ row|tojson(indent=2) }}</pre>
+    </details>
+    {% else %}<p class="muted">None.</p>{% endfor %}
+  </section>
+
+  <section>
+    <h2>Excluded at reranking ({{ gated|length }})</h2>
+    {% for item in gated %}
+    <article><strong>{{ item.job_id }}</strong>: {{ item.failed_requirement }}<pre>{{ item.feature_snapshot|tojson(indent=2) }}</pre></article>
+    {% else %}<p class="muted">None.</p>{% endfor %}
+  </section>
+
+  <section>
+    <h2>Filtered before scoring ({{ filtered|length }})</h2>
+    {% for item in filtered %}
+    <article><strong>{{ item.job.title }}</strong> at {{ item.job.company }}<p>{{ item.reasons|join('; ') }}</p></article>
+    {% else %}<p class="muted">None.</p>{% endfor %}
+  </section>
+
+  <section>
+    <h2>Judge failures ({{ judge_failures|length }})</h2>
+    {% for item in judge_failures %}
+    <article><strong>{{ item.job_id }}</strong><p>{{ item.judge_status }}: {{ item.error }}</p></article>
+    {% else %}<p class="muted">None.</p>{% endfor %}
+  </section>
+</body>
+</html>

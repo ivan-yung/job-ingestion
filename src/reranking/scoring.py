@@ -174,20 +174,22 @@ def _location_fit(candidate: CandidateProfile, job: JobRecord) -> float:
     return 1.0 if any(place.lower() in candidate_places for place in job.location) else 0.5
 
 
-def calculate_score(features: RerankFeatures) -> float:
+def calculate_score(features: RerankFeatures, weights: dict[str, float] | None = None) -> float:
     """Compute the weighted deterministic score."""
     if features.hard_requirement_status == "failed":
         return 0.0
+
+    weights = weights or WEIGHTS
         
     score = (
-        (features.required_skill_coverage * WEIGHTS["required_skill_coverage"]) +
-        (features.required_technology_coverage * WEIGHTS["required_technology_coverage"]) +
-        (features.title_similarity * WEIGHTS["title_similarity"]) +
-        (features.experience_fit * WEIGHTS["experience_fit"]) +
-        (features.semantic_score * WEIGHTS["semantic_score"]) +
-        (features.preferred_skill_coverage * WEIGHTS["preferred_skill_coverage"]) +
-        (features.preferred_technology_coverage * WEIGHTS["preferred_technology_coverage"]) +
-        (features.education_fit * WEIGHTS["education_fit"]) +
-        (features.location_fit * WEIGHTS["location_fit"])
+        (features.required_skill_coverage * weights["required_skill_coverage"]) +
+        (features.required_technology_coverage * weights["required_technology_coverage"]) +
+        (features.title_similarity * weights["title_similarity"]) +
+        (features.experience_fit * weights["experience_fit"]) +
+        (features.semantic_score * weights["semantic_score"]) +
+        (features.preferred_skill_coverage * weights["preferred_skill_coverage"]) +
+        (features.preferred_technology_coverage * weights["preferred_technology_coverage"]) +
+        (features.education_fit * weights["education_fit"]) +
+        (features.location_fit * weights["location_fit"])
     )
     return round(max(0.0, min(1.0, score)), 4)

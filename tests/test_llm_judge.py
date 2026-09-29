@@ -3,7 +3,8 @@ import json
 
 import pytest
 
-from src.llm.judge import RawCompletion, judge_jobs
+from src.llm.client import AttemptUsage, validate_strict_schema
+from src.llm.judge import RawCompletion, judge_jobs, resolve_reranked_jobs
 from src.llm.schemas import (
     JudgeConfig,
     JudgeResponse,
@@ -175,7 +176,7 @@ def test_final_score_hard_requirement_override(tmp_path):
         experience_fit=100,
         role_alignment=100,
         education_fit=100,
-        required_requirements=[RequirementEvaluation(requirement="Python", status=RequirementStatus.MISSING)],
+        required_requirements=[RequirementEvaluation(requirement="Python", status=RequirementStatus.MISSING, candidate_evidence=None, job_evidence=None)],
         preferred_requirements=[],
         strengths=[],
         concerns=[],
@@ -187,7 +188,7 @@ def test_final_score_hard_requirement_override(tmp_path):
     assert score.recommendation == Recommendation.DO_NOT_APPLY
 
     uncertain = missing.model_copy(update={
-        "required_requirements": [RequirementEvaluation(requirement="Python", status=RequirementStatus.UNCERTAIN)],
+        "required_requirements": [RequirementEvaluation(requirement="Python", status=RequirementStatus.UNCERTAIN, candidate_evidence=None, job_evidence=None)],
     })
     uncertain_score = final_qualification_score(uncertain, [RequirementInput(text="Python", classification="hard")])
     assert uncertain_score.needs_review is True
@@ -199,6 +200,17 @@ def test_final_score_hard_requirement_override(tmp_path):
     results, metrics = judge_jobs(make_candidate(), [make_job(required=["Python"])], config(tmp_path), transport)
     assert results[0].judge_status == "accepted"
     assert metrics.semantic_retries == 1
+
+
+def test_reranker_handoff_resolves_job_and_rejects_incomplete_result():
+    job = make_job(required=["Python"])
+    resolved = resolve_reranked_jobs([{"job_id": job.job_id, "qualification_score": 0.8}], {job.job_id: job})
+
+    assert resolved[0].job is job
+    assert resolved[0].rerank_result["qualification_score"] == 0.8
+
+    with pytest.raises(ValueError, match="matching jobs_by_id"):
+        resolve_reranked_jobs([{"job_id": "missing"}])
 
 
 def test_concurrency_and_cost_budget(tmp_path):
@@ -217,3 +229,84 @@ def test_concurrency_and_cost_budget(tmp_path):
     assert sum(result.judge_status == "accepted" for result in results) < len(jobs)
     assert metrics.budget_stop_reason == "cost_reservation_exceeded"
     assert metrics.estimated_cost_usd >= 0
+
+
+def test_strict_schema_and_optional_job_evidence(tmp_path):
+    from src.llm.schemas import JudgeResponse
+
+    schema = JudgeResponse.model_json_schema()
+    validate_strict_schema(schema)
+    evaluation_schema = schema["$defs"]["RequirementEvaluation"]
+    assert set(evaluation_schema["required"]) == {"requirement", "status", "candidate_evidence", "job_evidence"}
+
+    payload = valid_payload()
+    payload["required_requirements"][0]["job_evidence"] = None
+    results, _ = judge_jobs(
+        make_candidate(),
+        [make_job(required=["Python"])],
+        config(tmp_path),
+        FakeTransport([payload]),
+    )
+    assert results[0].judge_status == "accepted"
+
+
+def test_async_retry_backoff_is_non_blocking():
+    from src.retry import retry_async_call
+
+    attempts = 0
+    sleeps = []
+
+    async def operation():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 2:
+            error = RuntimeError("temporary")
+            error.status_code = 503
+            raise error
+        return "ok"
+
+    async def no_sleep(delay):
+        sleeps.append(delay)
+
+    result = asyncio.run(retry_async_call(
+        operation,
+        max_retries=2,
+        base_backoff_seconds=0.25,
+        sleep=no_sleep,
+        random_value=lambda: 0.0,
+    ))
+    assert result == "ok"
+    assert attempts == 2
+    assert sleeps == [0.25]
+
+
+def test_validation_failure_counts_completed_attempt_once(tmp_path):
+    invalid = valid_payload()
+    invalid["skills_fit"] = 101
+    valid = valid_payload()
+
+    class AttemptTransport(FakeTransport):
+        async def complete(self, **kwargs):
+            payload = self.payloads[min(self.calls, len(self.payloads) - 1)]
+            self.calls += 1
+            return RawCompletion(
+                payload=payload,
+                model_id=kwargs["model_id"],
+                input_tokens=100,
+                output_tokens=50,
+                latency_seconds=0.01,
+                transport_retries=0,
+                raw_response=json.dumps(payload),
+                attempts=[AttemptUsage(100, 50, 0.01, "success", False)],
+            )
+
+    results, metrics = judge_jobs(
+        make_candidate(),
+        [make_job(required=["Python"])],
+        config(tmp_path),
+        AttemptTransport([invalid, valid]),
+    )
+    assert results[0].judge_status == "accepted"
+    assert metrics.requests == 2
+    assert metrics.input_tokens == 200
+    assert metrics.output_tokens == 100
