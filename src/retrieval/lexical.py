@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
 
 import numpy as np
 from rank_bm25 import BM25Okapi
+
+from src.models.job import JobRecord
 
 
 PHRASE_TOKEN_REPLACEMENTS: list[tuple[re.Pattern[str], str]] = [
@@ -34,20 +35,28 @@ def tokenize_for_bm25(text: str) -> list[str]:
     if not cleaned:
         return []
 
-    return cleaned.split(" ")
+    tokens = []
+    for token in cleaned.split(" "):
+        # Strip trailing periods to handle end-of-sentence punctuation 
+        # while safely preserving leading periods (like .net)
+        token = token.rstrip(".")
+        if token:
+            tokens.append(token)
+            
+    return tokens
 
 
 @dataclass
 class BM25SearchIndex:
     """In-memory BM25 index over normalized jobs."""
 
-    jobs: list[dict[str, Any]]
+    jobs: list[JobRecord]
     tokenized_docs: list[list[str]]
     bm25: BM25Okapi
 
     @classmethod
-    def from_jobs(cls, jobs: list[dict[str, Any]]) -> "BM25SearchIndex":
-        tokenized_docs = [tokenize_for_bm25(str(job.get("searchable_text", ""))) for job in jobs]
+    def from_jobs(cls, jobs: list[JobRecord]) -> "BM25SearchIndex":
+        tokenized_docs = [tokenize_for_bm25(job.searchable_text or "") for job in jobs]
         return cls(jobs=jobs, tokenized_docs=tokenized_docs, bm25=BM25Okapi(tokenized_docs))
 
     def score(self, query: str) -> np.ndarray:

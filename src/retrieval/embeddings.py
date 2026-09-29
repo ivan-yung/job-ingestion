@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import random
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -13,6 +12,10 @@ from typing import Protocol
 
 import numpy as np
 
+from src.models.job import JobRecord
+from src.models.candidate import CandidateProfile
+from src.retry import is_transient_error, retry_call
+
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_EMBEDDING_VERSION = "1"
@@ -21,7 +24,6 @@ DEFAULT_EMBEDDING_VERSION = "1"
 @dataclass(frozen=True)
 class EmbeddingFingerprint:
     """Identity fields that make an embedding reusable."""
-
     content_hash: str
     embedding_model: str
     embedding_version: str
@@ -31,7 +33,6 @@ class EmbeddingFingerprint:
 @dataclass(frozen=True)
 class TextEmbeddingItem:
     """A piece of text that needs an embedding."""
-
     text: str
     content_hash: str
 
@@ -39,7 +40,6 @@ class TextEmbeddingItem:
 @dataclass
 class EmbeddingStats:
     """Diagnostics for embedding work."""
-
     api_calls: int = 0
     cache_hits: int = 0
     cache_misses: int = 0
@@ -49,7 +49,6 @@ class EmbeddingStats:
 
 class EmbeddingProvider(Protocol):
     """Pluggable embedding provider."""
-
     def embed_texts(self, texts: list[str], model: str) -> list[list[float]]:
         """Return vectors for each text in order."""
 
@@ -75,7 +74,6 @@ class OpenAIEmbeddingProvider:
         """Lazy-load OpenAI client to keep tests lightweight."""
         if self._client is None:
             from openai import OpenAI
-
             self._client = OpenAI(api_key=self._api_key)
         return self._client
 
@@ -83,45 +81,23 @@ class OpenAIEmbeddingProvider:
         if not texts:
             return []
 
-        attempt = 0
-        while True:
-            try:
-                response = self.client.embeddings.create(model=model, input=texts)
-                return [row.embedding for row in response.data]
-            except Exception as exc:  # pragma: no cover - exercised by integration
-                if not self._is_transient(exc) or attempt >= self.max_retries:
-                    raise
-
-                delay = min(self.max_backoff_seconds, self.base_backoff_seconds * (2 ** attempt))
-                delay += random.uniform(0, delay * 0.25)
-                time.sleep(delay)
-                attempt += 1
+        response = retry_call(
+            lambda: self.client.embeddings.create(model=model, input=texts),
+            max_retries=self.max_retries,
+            base_backoff_seconds=self.base_backoff_seconds,
+            max_backoff_seconds=self.max_backoff_seconds,
+        )
+        return [row.embedding for row in response.data]
 
     @staticmethod
     def _is_transient(exc: Exception) -> bool:
-        name = exc.__class__.__name__.lower()
-        status_code = getattr(exc, "status_code", None)
-
-        transient_names = {
-            "apiconnectionerror",
-            "apitimeouterror",
-            "ratelimiterror",
-            "internalservererror",
-            "serviceunavailableerror",
-        }
-        if name in transient_names:
-            return True
-
-        if isinstance(status_code, int) and status_code >= 500:
-            return True
-
-        return False
+        return is_transient_error(exc)
 
 
 class SQLiteEmbeddingCache:
     """Simple SQLite cache for embeddings keyed by content+model."""
 
-    def __init__(self, db_path: str | Path = "embedding_cache.db") -> None:
+    def __init__(self, db_path: str | Path = "resume_ranker.db") -> None:
         self.db_path = str(db_path)
         self._initialize()
 
@@ -284,3 +260,58 @@ def embed_with_cache(
             cache.put(fingerprint=fingerprint, vector=vector)
 
     return [vector for vector in vectors if vector is not None], stats
+
+
+def cosine_similarity(v1: np.ndarray | None, v2: np.ndarray | None) -> float:
+    """Calculates cosine similarity between two normalized vectors."""
+    if v1 is None or v2 is None:
+        return 0.0
+    return float(np.dot(v1, v2))
+
+
+def extract_job_embedding_items(job: JobRecord) -> dict[str, TextEmbeddingItem]:
+    """Extracts the three text components for a job for semantic scoring with fallbacks."""
+    skills = (job.required_qualifications or []) + (job.preferred_qualifications or []) + (job.technologies or [])
+    skills_text = ", ".join(skills) if skills else "No specific skills listed"
+    
+    role_text = f"{job.seniority or ''} {job.normalized_title or ''}".strip()
+    if not role_text:
+        role_text = "Unknown role"
+        
+    overall_text = f"{job.summary or ''} {job.description_raw or ''}".strip()
+    if not overall_text:
+        overall_text = "No description provided"
+    
+    return {
+        "overall": TextEmbeddingItem(text=overall_text, content_hash=hash_content(f"{job.content_hash}_overall")),
+        "skills": TextEmbeddingItem(text=skills_text, content_hash=hash_content(f"{job.content_hash}_skills")),
+        "role": TextEmbeddingItem(text=role_text, content_hash=hash_content(f"{job.content_hash}_role"))
+    }
+
+
+def extract_candidate_embedding_items(candidate: CandidateProfile) -> dict[str, TextEmbeddingItem]:
+    """Extracts the three text components for a candidate for semantic scoring with fallbacks."""
+    langs = getattr(candidate.skills, 'languages', []) if hasattr(candidate, 'skills') else []
+    fwks = getattr(candidate.skills, 'frameworks', []) if hasattr(candidate, 'skills') else []
+    all_skills = langs + fwks
+    skills_text = ", ".join(all_skills) if all_skills else "No skills listed"
+    
+    level = getattr(candidate, 'experience_level', '') or ''
+    years = getattr(candidate, 'years_experience', '') or ''
+    role_text = f"{level} {years} years".strip()
+    if not role_text or role_text == "years":
+        role_text = "Unknown experience"
+    
+    experiences = getattr(candidate, 'professional_experience', []) or []
+    exp_list = [getattr(exp, 'description', '') for exp in experiences if hasattr(exp, 'description')]
+    summary = getattr(candidate, 'summary', '') or ''
+    overall_text = f"{summary} {' '.join(exp_list)}".strip()
+    
+    if not overall_text:
+        overall_text = "No summary or experience provided"
+    
+    return {
+        "overall": TextEmbeddingItem(text=overall_text, content_hash=hash_content(f"candidate_overall_{overall_text}")),
+        "skills": TextEmbeddingItem(text=skills_text, content_hash=hash_content(f"candidate_skills_{skills_text}")),
+        "role": TextEmbeddingItem(text=role_text, content_hash=hash_content(f"candidate_role_{role_text}"))
+    }

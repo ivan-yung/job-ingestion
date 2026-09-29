@@ -1,306 +1,156 @@
-"""Hard filtering logic for candidate-job compatibility."""
-
+"""Hard filtering logic for jobs."""
 from __future__ import annotations
 
-from typing import NamedTuple
+import re
+from dataclasses import dataclass
 
 from src.models.candidate import CandidateProfile
 from src.models.job import ClassifiedJobRecord
 
 
-class FilterResult(NamedTuple):
-    """Result of a hard filter check."""
-
+@dataclass
+class FilterResult:
     passed: bool
-    reason: str | None
+    reason: str | None = None
 
 
-class HardFilterDecision(NamedTuple):
-    """Final hard filter decision for a job."""
-
+@dataclass
+class FilterDecision:
     job_id: str
     rejected: bool
     rejection_reasons: list[str]
-    retention_reasons: list[str]
 
 
-def filter_by_work_authorization(
-    candidate: CandidateProfile,
-    job: ClassifiedJobRecord,
-) -> FilterResult:
-    """Check work authorization compatibility.
-
-    Only rejects if:
-    - Job explicitly requires US work authorization
-    - Candidate explicitly states they need visa sponsorship
-
-    Args:
-        candidate: Candidate profile.
-        job: Job record.
-
-    Returns:
-        Filter result.
-    """
-    if not candidate.work_authorization or not job.description_raw:
-        return FilterResult(passed=True, reason=None)
-
-    # Only hard-reject if explicitly incompatible
-    if (
-        candidate.work_authorization == "VISA_SPONSOR_NEEDED"
-        and "no visa sponsorship" in job.description_raw.lower()
-    ):
-        return FilterResult(
-            passed=False,
-            reason="Candidate needs visa sponsorship but job does not offer it",
-        )
-
-    return FilterResult(passed=True, reason=None)
-
-
-def filter_by_remote_preference(
-    candidate: CandidateProfile,
-    job: ClassifiedJobRecord,
-) -> FilterResult:
-    """Check remote work preference compatibility.
-
-    Only rejects if:
-    - Candidate only wants remote
-    - Job is only onsite
-
-    Args:
-        candidate: Candidate profile.
-        job: Job record.
-
-    Returns:
-        Filter result.
-    """
-    if not candidate.remote_preference or candidate.remote_preference == "onsite":
-        # Candidate is flexible or prefers onsite
-        return FilterResult(passed=True, reason=None)
-
-    if candidate.remote_preference == "remote":
-        if job.remote_type == "onsite":
-            return FilterResult(
-                passed=False,
-                reason="Candidate requires remote but job is onsite-only",
-            )
-
-    if candidate.remote_preference == "hybrid":
-        if job.remote_type == "onsite":
-            return FilterResult(
-                passed=False,
-                reason="Candidate requires hybrid/remote but job is onsite-only",
-            )
-
-    return FilterResult(passed=True, reason=None)
-
-
-def filter_by_location(
-    candidate: CandidateProfile,
-    job: ClassifiedJobRecord,
-) -> FilterResult:
-    """Check location compatibility.
-
-    Only rejects if:
-    - Job requires specific location
-    - Candidate has different specific location
-    - Both cannot work (onsite job, candidate elsewhere)
-
-    Args:
-        candidate: Candidate profile.
-        job: Job record.
-
-    Returns:
-        Filter result.
-    """
-    if (
-        not candidate.location
-        or not job.location
-        or job.remote_type != "onsite"
-    ):
-        return FilterResult(passed=True, reason=None)
-
-    # Check if candidate location overlaps with job location
-    candidate_locations = [loc.lower() for loc in candidate.location]
-    job_locations = [loc.lower() for loc in job.location]
-
-    for cand_loc in candidate_locations:
-        for job_loc in job_locations:
-            if cand_loc in job_loc or job_loc in cand_loc:
-                return FilterResult(passed=True, reason=None)
-
-    # No location overlap and job is onsite
-    return FilterResult(
-        passed=False,
-        reason=f"Job is onsite in {', '.join(job.location)} but candidate is in {', '.join(candidate.location)}",
-    )
-
-
-def filter_by_employment_type(
-    candidate: CandidateProfile,
-    job: ClassifiedJobRecord,
-) -> FilterResult:
-    """Check employment type compatibility.
-
-    Only rejects if:
-    - Job specifies a type
-    - Candidate cannot work that type
-
-    Args:
-        candidate: Candidate profile.
-        job: Job record.
-
-    Returns:
-        Filter result.
-    """
-    if not job.employment_type:
-        return FilterResult(passed=True, reason=None)
-
-    # For now, only allow employment type to be informational
-    # Do not hard-reject based on employment type
-    return FilterResult(passed=True, reason=None)
-
-
-def filter_by_education(
-    candidate: CandidateProfile,
-    job: ClassifiedJobRecord,
-) -> FilterResult:
-    """Check education requirements.
-
-    Only rejects if:
-    - Job explicitly requires a specific degree
-    - Candidate cannot satisfy it
-
-    Args:
-        candidate: Candidate profile.
-        job: Job record.
-
-    Returns:
-        Filter result.
-    """
-    if not job.education_requirements:
-        return FilterResult(passed=True, reason=None)
-
-    # Check if candidate has any education
-    if candidate.education:
-        return FilterResult(passed=True, reason=None)
-
-    # If job requires CS degree and candidate has no education, might reject
-    for req in job.education_requirements:
-        if "bachelor" in req.lower() and "computer science" in req.lower():
-            if not candidate.education:
-                return FilterResult(
-                    passed=False,
-                    reason="Job requires Bachelor's in Computer Science but candidate has no degree listed",
-                )
-
-    return FilterResult(passed=True, reason=None)
-
-
-def filter_by_experience_years(
-    candidate: CandidateProfile,
-    job: ClassifiedJobRecord,
-) -> FilterResult:
-    """Check experience requirement compatibility.
-
-    Only rejects if:
-    - Job explicitly requires N+ years
-    - Candidate has significantly less
-
-    Conservative: only reject if clearly impossible.
-
-    Args:
-        candidate: Candidate profile.
-        job: Job record.
-
-    Returns:
-        Filter result.
-    """
-    if not job.experience_requirements:
-        return FilterResult(passed=True, reason=None)
-
-    # Check for explicit requirement (e.g., "10+ years required")
-    import re
-    for req in job.experience_requirements:
-        match = re.search(r"(\d+)\+?\s*years?\s*required", req, re.IGNORECASE)
+def filter_by_experience_years(candidate: CandidateProfile, job: ClassifiedJobRecord) -> FilterResult:
+    """Hard filter jobs only when the experience gap is severe and explicitly required."""
+    if getattr(candidate, 'years_experience', None) is None:
+        return FilterResult(passed=True)
+        
+    req_years = None
+    
+    if job.experience_requirements:
+        for req in job.experience_requirements:
+            match = re.search(r'(\d+)', req)
+            if match:
+                req_years = int(match.group(1))
+                break
+                
+    if req_years is None and job.description_raw:
+        match = re.search(r'(\d+)\+?\s*years.*required', job.description_raw, re.IGNORECASE)
         if match:
-            required_years = int(match.group(1))
+            req_years = int(match.group(1))
+            
+    if req_years is not None:
+        if candidate.years_experience < (req_years - 3) or candidate.years_experience < (req_years / 2):
+            return FilterResult(
+                passed=False, 
+                reason=f"Severe experience mismatch: Candidate has {candidate.years_experience}y, job strictly requires {req_years}y+"
+            )
+            
+    return FilterResult(passed=True)
 
-            # Only hard reject if candidate has <20% of required years
-            if candidate.years_experience < required_years * 0.2:
-                return FilterResult(
-                    passed=False,
-                    reason=f"Job requires {required_years}+ years but candidate has {candidate.years_experience}",
-                )
 
-    return FilterResult(passed=True, reason=None)
+def filter_by_education(candidate: CandidateProfile, job: ClassifiedJobRecord) -> FilterResult:
+    """Filter by strict education requirements."""
+    return FilterResult(passed=True)
 
 
-def check_hard_filters(
-    candidate: CandidateProfile,
-    job: ClassifiedJobRecord,
-) -> HardFilterDecision:
-    """Check all hard filters for a job.
+def filter_by_employment_type(candidate: CandidateProfile, job: ClassifiedJobRecord) -> FilterResult:
+    """Filter by incompatible employment type."""
+    if not job.employment_type:
+        return FilterResult(passed=True)
+        
+    cand_prefs = getattr(candidate, 'employment_preferences', [])
+    if cand_prefs and "Contract" not in cand_prefs and "contract" in job.employment_type.lower():
+        return FilterResult(passed=False, reason=f"Incompatible employment type: {job.employment_type}")
+        
+    return FilterResult(passed=True)
 
-    Args:
-        candidate: Candidate profile.
-        job: Job record.
 
-    Returns:
-        Hard filter decision.
-    """
-    rejection_reasons = []
-    retention_reasons = []
+def filter_by_location(candidate: CandidateProfile, job: ClassifiedJobRecord) -> FilterResult:
+    """Filter by impossible location constraints."""
+    if not job.location or not getattr(candidate, 'location', None):
+        return FilterResult(passed=True)
+        
+    if getattr(job, 'remote_type', '') == "remote":
+        return FilterResult(passed=True)
+        
+    job_locs = {loc.lower().strip() for loc in job.location}
+    cand_locs = {loc.lower().strip() for loc in candidate.location}
+    
+    for c_loc in cand_locs:
+        for j_loc in job_locs:
+            if c_loc in j_loc or j_loc in c_loc:
+                return FilterResult(passed=True)
+                
+    return FilterResult(passed=False, reason="Location mismatch for non-remote job")
 
-    # Apply all filters
-    filters = [
-        ("Work Authorization", filter_by_work_authorization),
-        ("Remote Preference", filter_by_remote_preference),
-        ("Location", filter_by_location),
-        ("Employment Type", filter_by_employment_type),
-        ("Education", filter_by_education),
-        ("Experience", filter_by_experience_years),
-    ]
 
-    for filter_name, filter_func in filters:
-        result = filter_func(candidate, job)
+def filter_by_work_authorization(candidate: CandidateProfile, job: ClassifiedJobRecord) -> FilterResult:
+    """Filter by work authorization conflicts."""
+    auth = getattr(candidate, 'work_authorization', None)
+    if auth == "VISA_SPONSOR_NEEDED":
+        desc = (job.description_raw or "").lower()
+        if "no visa sponsorship" in desc or "does not sponsor" in desc or "cannot sponsor" in desc:
+            return FilterResult(passed=False, reason="Job does not offer required visa sponsorship")
+            
+    return FilterResult(passed=True)
 
-        if not result.passed and result.reason:
-            rejection_reasons.append(result.reason)
-        elif result.passed and result.reason:
-            retention_reasons.append(f"{filter_name}: {result.reason}")
 
-    rejected = len(rejection_reasons) > 0
-
-    return HardFilterDecision(
-        job_id=job.job_id,
-        rejected=rejected,
-        rejection_reasons=rejection_reasons,
-        retention_reasons=retention_reasons,
-    )
+def filter_by_remote_preference(candidate: CandidateProfile, job: ClassifiedJobRecord) -> FilterResult:
+    """Filter by incompatible remote preference."""
+    pref = getattr(candidate, 'remote_preference', None)
+    if not pref:
+        return FilterResult(passed=True)
+        
+    if pref.lower() == "remote":
+        if getattr(job, 'remote_type', '') == "onsite":
+            return FilterResult(passed=False, reason="Candidate requires remote, job is onsite")
+            
+        desc = (job.description_raw or "").lower()
+        if "onsite position" in desc or "100% onsite" in desc:
+            return FilterResult(passed=False, reason="Candidate requires remote, job is onsite")
+            
+    return FilterResult(passed=True)
 
 
 def apply_hard_filters(
-    candidate: CandidateProfile,
-    jobs: list[ClassifiedJobRecord],
-) -> tuple[list[ClassifiedJobRecord], list[HardFilterDecision]]:
-    """Apply hard filters to a list of jobs.
-
-    Args:
-        candidate: Candidate profile.
-        jobs: List of jobs to filter.
-
-    Returns:
-        Tuple of (retained_jobs, all_decisions).
-    """
+    candidate: CandidateProfile, 
+    jobs: list[ClassifiedJobRecord]
+) -> tuple[list[ClassifiedJobRecord], list[FilterDecision]]:
+    """Apply all hard filters and return retained jobs + decisions."""
     retained = []
     decisions = []
-
+    
     for job in jobs:
-        decision = check_hard_filters(candidate, job)
-        decisions.append(decision)
+        reasons = []
+        
+        for filter_func in [
+            filter_by_experience_years, 
+            filter_by_education, 
+            filter_by_employment_type,
+            filter_by_location,
+            filter_by_work_authorization,
+            filter_by_remote_preference
+        ]:
+            result = filter_func(candidate, job)
+            if not result.passed:
+                reasons.append(result.reason or f"{filter_func.__name__} failed")
 
-        if not decision.rejected:
+        is_rejected = len(reasons) > 0
+        decisions.append(FilterDecision(
+            job_id=job.job_id,
+            rejected=is_rejected,
+            rejection_reasons=reasons
+        ))
+        
+        if not is_rejected:
             retained.append(job)
-
+            
     return retained, decisions
+
+
+def check_hard_filters(candidate: CandidateProfile, job: ClassifiedJobRecord) -> FilterDecision:
+    """Helper to check a single job."""
+    _, decisions = apply_hard_filters(candidate, [job])
+    return decisions[0]
